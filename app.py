@@ -98,7 +98,6 @@ def load_and_prep_data():
             return pd.Series(default_info)
 
         # Apply parsing (Cached)
-        # Note: We rely on the 'usages' column being present.
         if 'usages' in gdf.columns:
             usage_data = gdf['usages'].apply(parse_latest_usage)
             gdf = pd.concat([gdf, usage_data], axis=1)
@@ -106,8 +105,6 @@ def load_and_prep_data():
             # Convert derived dates
             gdf['Plant_Date'] = pd.to_datetime(gdf['Plant_Date'], errors='coerce')
             gdf['Harvest_Date'] = pd.to_datetime(gdf['Harvest_Date'], errors='coerce')
-        else:
-            st.warning("⚠️ 'usages' column missing from plant_cultivation.parquet")
 
     except Exception as e:
         st.error(f"❌ Error reading 'plant_cultivation.parquet': {e}")
@@ -206,7 +203,7 @@ if page == "📊 Regional Dashboard":
             folium.GeoJson(
                 map_data,
                 style_function=style_fn,
-                tooltip=folium.GeoJsonTooltip(fields=['landName', 'ap_en', 'rai'])
+                tooltip=folium.GeoJsonTooltip(fields=['landName', 'ap_en', 'rai', 'id_cultivation'])
             ).add_to(m)
             st_folium(m, height=500, use_container_width=True)
             
@@ -233,7 +230,7 @@ if page == "📊 Regional Dashboard":
             
     with t2:
         if not dashboard_merged.empty:
-            top_farmers = dashboard_merged.groupby(['landName', 'ap_en'])['Burn_area'].sum().reset_index().sort_values('Burn_area', ascending=True).head(10)
+            top_farmers = dashboard_merged.groupby(['landName', 'ap_en'])['Burn_area'].sum().reset_index().sort_values('Burn_area', ascending=False).head(10)
             st.plotly_chart(px.bar(top_farmers, x='Burn_area', y='landName', orientation='h', color='Burn_area', color_continuous_scale='Reds'), use_container_width=True)
 
 # ==========================================
@@ -245,112 +242,132 @@ elif page == "👨‍🌾 Farmer Inspector":
     st.sidebar.markdown("---")
     st.sidebar.subheader("🔎 Find Farmer")
     
-    # Sort by Total Burn
-    farmer_ranks = df_merged.groupby(['landName', 'id_cultivation'])['Burn_area'].sum().reset_index()
-    farmer_ranks = farmer_ranks.sort_values('Burn_area', ascending=False)
+    # --- SEARCH MODE SELECTION ---
+    search_mode = st.sidebar.radio("Find by:", ["🔥 Top Burners List", "🆔 Specific ID"])
     
-    farmer_ranks['label'] = farmer_ranks.apply(
-        lambda x: f"{x['landName']} (ID: {x['id_cultivation']}) - Total Burn: {x['Burn_area']:.2f} Rai", axis=1
-    )
+    selected_id = None
     
-    selected_label = st.sidebar.selectbox("Select Farmer (Sorted by Burn)", farmer_ranks['label'])
-    selected_id = int(selected_label.split("(ID: ")[1].split(")")[0])
-    
-    # Specific Data
-    farmer_geo = gdf_cultivation[gdf_cultivation['id_cultivation'] == selected_id].iloc[0]
-    farmer_burns = df_merged[(df_merged['id_cultivation'] == selected_id) & (df_merged['Burn_area'] > 0)]
-    
-    # Metrics
-    with st.container():
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("👤 Name", farmer_geo['landName'])
-        m2.metric("📍 District", farmer_geo['ap_en'])
-        m3.metric("📐 Area", f"{farmer_geo['rai']:.2f} Rai")
-        m4.metric("🔥 Total Burned", f"{farmer_burns['Burn_area'].sum():,.2f} Rai")
+    if search_mode == "🔥 Top Burners List":
+        # Sort by Total Burn Area
+        farmer_ranks = df_merged.groupby(['landName', 'id_cultivation'])['Burn_area'].sum().reset_index()
+        farmer_ranks = farmer_ranks.sort_values('Burn_area', ascending=False)
         
-    st.divider()
-    
-    # Analysis Grid
-    c_left, c_right = st.columns([1, 2])
-    
-    with c_left:
-        st.subheader("🌱 Cultivation History")
+        farmer_ranks['label'] = farmer_ranks.apply(
+            lambda x: f"{x['landName']} (ID: {x['id_cultivation']}) - Total Burn: {x['Burn_area']:.2f} Rai", axis=1
+        )
         
-        # --- ROBUST CULTIVATION HISTORY PARSING ---
-        raw_usages = farmer_geo['usages']
+        selected_label = st.sidebar.selectbox("Select Farmer", farmer_ranks['label'])
+        selected_id = int(selected_label.split("(ID: ")[1].split(")")[0])
         
-        # Ensure it's a list (Fix for Numpy Arrays)
-        if isinstance(raw_usages, np.ndarray):
-            raw_usages_list = raw_usages.tolist()
-        elif isinstance(raw_usages, list):
-            raw_usages_list = raw_usages
-        else:
-            raw_usages_list = []
-
-        if raw_usages_list:
-            history_list = []
-            for item in raw_usages_list:
-                if isinstance(item, dict):
-                    cycle = {
-                        'Plant Date': item.get('plantDate'),
-                        'Harvest Date': item.get('harvestDate'),
-                        'Season': item.get('extension', {}).get('seasonName', 'N/A'),
-                        'Variety': item.get('extension', {}).get('riceVariety', 'N/A'),
-                        'Type': item.get('extension', {}).get('riceType', 'N/A'),
-                    }
-                    history_list.append(cycle)
-            
-            if history_list:
-                history_df = pd.DataFrame(history_list)
-                # Sort by Plant Date descending
-                history_df['Plant Date'] = pd.to_datetime(history_df['Plant Date'], errors='coerce')
-                history_df = history_df.sort_values('Plant Date', ascending=False)
-                
-                # Format for display
-                history_df['Plant Date'] = history_df['Plant Date'].dt.strftime('%Y-%m-%d')
-                
-                # Check if 'Harvest Date' column exists before formatting
-                if 'Harvest Date' in history_df.columns:
-                     history_df['Harvest Date'] = pd.to_datetime(history_df['Harvest Date'], errors='coerce').dt.strftime('%Y-%m-%d')
-                
-                st.dataframe(history_df, use_container_width=True, hide_index=True)
+    else: # Search by ID (Lookup in Cultivation Data)
+        input_id = st.sidebar.number_input("Enter Farmer ID", value=0, step=1)
+        if input_id > 0:
+            # Check if this ID exists in the updated plant_cultivation file
+            if input_id in gdf_cultivation['id_cultivation'].values:
+                selected_id = input_id
             else:
-                st.info("Usage data found, but format was empty.")
+                st.sidebar.error(f"❌ ID {input_id} not found in plant_cultivation.parquet.")
+                st.stop()
         else:
-            st.warning("No detailed cultivation history available.")
+            st.info("Please enter a valid ID from the cultivation file.")
+            st.stop()
+    
+    # --- GET SPECIFIC DATA ---
+    if selected_id is not None:
+        farmer_geo = gdf_cultivation[gdf_cultivation['id_cultivation'] == selected_id].iloc[0]
+        farmer_burns = df_merged[(df_merged['id_cultivation'] == selected_id) & (df_merged['Burn_area'] > 0)]
         
-        st.markdown("#### Plot Geometry")
-        bounds = farmer_geo.geometry.bounds
-        center = [(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2]
-        mini_map = folium.Map(location=center, zoom_start=13, tiles="CartoDB positron")
-        folium.GeoJson(farmer_geo.geometry, style_function=lambda x: {'color': 'blue', 'fillColor': 'blue', 'weight': 2}).add_to(mini_map)
-        st_folium(mini_map, height=300, use_container_width=True)
-        
-    with c_right:
-        st.subheader("🔥 Burn History Analysis")
-        
-        if not farmer_burns.empty:
-            fig = px.bar(
-                farmer_burns, x='Date_Month', y='Burn_area', color='src',
-                title="Burn Events Timeline", labels={'Burn_area': 'Burned Area (Rai)'}
-            )
+        # Metrics
+        with st.container():
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("👤 Name", farmer_geo['landName'])
+            m2.metric("📍 District", farmer_geo['ap_en'])
+            m3.metric("📐 Area", f"{farmer_geo['rai']:.2f} Rai")
+            m4.metric("🔥 Total Burned", f"{farmer_burns['Burn_area'].sum():,.2f} Rai")
             
-            # Add Harvest Markers
-            if 'history_df' in locals() and not history_df.empty:
-                for _, row in history_df.iterrows():
-                    h_date_str = row['Harvest Date']
-                    if pd.notnull(h_date_str) and h_date_str != "NaT" and h_date_str is not None:
-                        try:
-                            h_dt = pd.to_datetime(h_date_str)
-                            fig.add_vline(
-                                x=h_dt.timestamp() * 1000, 
-                                line_dash="dash", line_color="green", opacity=0.5,
-                                annotation_text=f"Harvest"
-                            )
-                        except:
-                            pass
-                        
-            st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(farmer_burns[['Date_Month', 'src', 'Burn_area']].sort_values('Date_Month', ascending=False), use_container_width=True)
-        else:
-            st.success("No burn history detected for this farmer.")
+        st.divider()
+        
+        # Analysis Grid
+        c_left, c_right = st.columns([1, 2])
+        
+        with c_left:
+            st.subheader("🌱 Cultivation History")
+            
+            # --- ROBUST CULTIVATION HISTORY PARSING ---
+            raw_usages = farmer_geo['usages']
+            
+            # Ensure it's a list (Fix for Numpy Arrays)
+            if isinstance(raw_usages, np.ndarray):
+                raw_usages_list = raw_usages.tolist()
+            elif isinstance(raw_usages, list):
+                raw_usages_list = raw_usages
+            else:
+                raw_usages_list = []
+
+            history_df = pd.DataFrame() # Initialize empty
+            if raw_usages_list:
+                history_list = []
+                for item in raw_usages_list:
+                    if isinstance(item, dict):
+                        cycle = {
+                            'Plant Date': item.get('plantDate'),
+                            'Harvest Date': item.get('harvestDate'),
+                            'Season': item.get('extension', {}).get('seasonName', 'N/A'),
+                            'Variety': item.get('extension', {}).get('riceVariety', 'N/A'),
+                            'Type': item.get('extension', {}).get('riceType', 'N/A'),
+                        }
+                        history_list.append(cycle)
+                
+                if history_list:
+                    history_df = pd.DataFrame(history_list)
+                    # Sort by Plant Date descending
+                    history_df['Plant Date'] = pd.to_datetime(history_df['Plant Date'], errors='coerce')
+                    history_df = history_df.sort_values('Plant Date', ascending=False)
+                    
+                    # Format for display
+                    history_df['Plant Date'] = history_df['Plant Date'].dt.strftime('%Y-%m-%d')
+                    
+                    if 'Harvest Date' in history_df.columns:
+                        history_df['Harvest Date'] = pd.to_datetime(history_df['Harvest Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    
+                    st.dataframe(history_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Usage data found, but format was empty.")
+            else:
+                st.warning("No detailed cultivation history available.")
+            
+            st.markdown("#### Plot Geometry")
+            bounds = farmer_geo.geometry.bounds
+            center = [(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2]
+            mini_map = folium.Map(location=center, zoom_start=13, tiles="CartoDB positron")
+            folium.GeoJson(farmer_geo.geometry, style_function=lambda x: {'color': 'blue', 'fillColor': 'blue', 'weight': 2}).add_to(mini_map)
+            st_folium(mini_map, height=300, use_container_width=True)
+            
+        with c_right:
+            st.subheader("🔥 Burn History Analysis")
+            
+            if not farmer_burns.empty:
+                fig = px.bar(
+                    farmer_burns, x='Date_Month', y='Burn_area', color='src',
+                    title="Burn Events Timeline", labels={'Burn_area': 'Burned Area (Rai)'}
+                )
+                
+                # Add Harvest Markers
+                if not history_df.empty:
+                    for _, row in history_df.iterrows():
+                        h_date_str = row['Harvest Date']
+                        if pd.notnull(h_date_str) and h_date_str != "NaT" and h_date_str is not None:
+                            try:
+                                h_dt = pd.to_datetime(h_date_str)
+                                fig.add_vline(
+                                    x=h_dt.timestamp() * 1000, 
+                                    line_dash="dash", line_color="green", opacity=0.5,
+                                    annotation_text=f"Harvest"
+                                )
+                            except:
+                                pass
+                            
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(farmer_burns[['Date_Month', 'src', 'Burn_area']].sort_values('Date_Month', ascending=False), use_container_width=True)
+            else:
+                st.success("No burn history detected for this farmer.")
